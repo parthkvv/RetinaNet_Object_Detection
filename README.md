@@ -1,5 +1,3 @@
-keras-retinanet readme file
-
 Dataset Preparation
 	The base data directory should consist of the following files:
 		"xml" folder - containing the annotations for IDD dataset in xml format
