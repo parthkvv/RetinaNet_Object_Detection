@@ -1,0 +1,12 @@
+bicycle 569
+bus 4916
+traffic sign 4287
+motorcycle 25489
+car 24844
+traffic light 919
+person 18078
+vehicle fallback 6089
+truck 7078
+autorickshaw 7782
+animal 1460
+rider 24518

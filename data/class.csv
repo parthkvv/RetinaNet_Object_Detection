@@ -1,0 +1,12 @@
+bicycle,0
+bus,1
+traffic sign,2
+motorcycle,3
+car,4
+traffic light,5
+person,6
+vehicle fallback,7
+truck,8
+autorickshaw,9
+animal,10
+rider,11

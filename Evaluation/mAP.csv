@@ -1,0 +1,16 @@
+class_name,avg_precision(s_t_0.05),avg_precision(s_t_0.3)
+bicycle,0.2461,0.231
+bus,0.4561,0.4146
+traffic sign,0.0846,0.0687
+motorcycle,0.4032,0.3745
+car,0.4815,0.4389
+traffic light,0.0269,0.0175
+person,0.2539,0.2237
+vehicle fallback,0.0232,0.0194
+truck,0.4626,0.4222
+autorickshaw,0.4546,0.4175
+animal,0.1007,0.0955
+rider,0.3329,0.3039
+,,
+mAP using wt avg,0.3511,0.3202
+mAP ,0.2772,0.2523

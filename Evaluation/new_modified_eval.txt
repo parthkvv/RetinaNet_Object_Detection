@@ -1,0 +1,562 @@
+from __future__ import absolute_import, division, print_function
+from detection_image import detection_on_image
+import csv
+import os
+import numpy as np
+import pandas as pd
+
+INF_MIN = -99999999999999
+INF_MAX =  99999999999999
+IOU_THR = 0.5
+
+def get_model_scores_map(pred_boxes):
+
+	model_scores_map = {}
+	for img_id, val in pred_boxes.items():
+		for score in val['scores']:
+			if score not in model_scores_map.keys():
+				model_scores_map[score] = [img_id]
+			else:
+				model_scores_map[score].append(img_id)
+	return model_scores_map
+
+
+def average_iou(gt_boxes, pred_boxes, iou_thr):
+    """Calculate number of True Positive, False Positive, False Negative from single batch of boxes.
+    
+    Arguments:-	
+    gt_boxes : Location of predicted object as [xmin, ymin, xmax, ymax]
+    pred_Box   : Dictionary of dictionary of ground truth object as [xmin, ymin, xmax, ymax] and 'scores'
+    iou_thr  : Value of IOU to consider as threshold for classify correct prediction and false prediction.	
+    
+    Returns:
+        dict : True Positive , False Positive, False Negative
+    """
+
+    print("gt_boxes:",gt_boxes)
+    print("pred_boxes:",pred_boxes)
+    print("gt_length", len(gt_boxes))
+    print("pred_lenght", len(pred_boxes))
+
+    all_pred_indices = range(len(pred_boxes))
+    all_gt_indices = range(len(gt_boxes))
+    # print("all_gt_indices",all_gt_indices)
+    # print("all_pred_indices", all_pred_indices)
+
+    if len(all_pred_indices) == 0:
+        print("going in pred_indixes==0")
+        tp = 0
+        fp = 0
+        fn = len(gt_boxes)
+        return {'true_pos': tp, 'false_pos': fp, 'false_neg': fn ,'avg' : 0, 'total_obj' : len(gt_boxes) }
+        
+    if len(all_gt_indices) == 0:
+        tp = 0
+        if len(pred_boxes) != 0:
+            fp = len(pred_boxes)
+        else:
+            fp = 0
+        fn = 0
+        return {'true_pos': tp, 'false_pos': fp, 'false_neg': fn, 'avg' : 0, 'total_obj' : len(gt_boxes) }
+        #return tp
+
+    gt_idx_thr = []
+    pred_idx_thr = []
+    ious = []
+    for ipb, pred_box in enumerate(pred_boxes):
+        for igb, gt_box in enumerate(gt_boxes):
+            iou = calc_iou_individual(pred_box, gt_box) # Calculating IOU
+            if iou > iou_thr:	
+                gt_idx_thr.append(igb)
+                pred_idx_thr.append(ipb)
+                ious.append(iou)
+
+    args_desc = np.argsort(ious)[::-1]
+    if len(args_desc) == 0:
+        # No matches
+        tp = 0
+        fp = len(pred_boxes)
+        fn = len(gt_boxes)
+    else:
+        gt_match_idx = []
+        pred_match_idx = []
+        list_iou = []
+        for idx in args_desc:
+            gt_idx = gt_idx_thr[idx]
+            pr_idx = pred_idx_thr[idx]
+            if (gt_idx not in gt_match_idx) and (pr_idx not in pred_match_idx):
+                gt_match_idx.append(gt_idx)
+                pred_match_idx.append(pr_idx)
+                list_iou.append(ious[idx])
+        
+        tp = len(gt_match_idx)
+        fp = len(pred_boxes) - len(pred_match_idx)
+        fn = len(gt_boxes) - len(gt_match_idx)
+    
+    sumx = 0
+    avg = 0
+    if tp != 0:
+        for i in list_iou:
+            sumx += i
+        avg = sumx/len(gt_boxes)
+    else:
+        avg = -1
+    
+    return {'true_pos': tp, 'false_pos': fp, 'false_neg': fn, 'avg' : avg, 'total_obj' : len(gt_boxes) } # Returns cells of Confusion Matrix
+
+def calc_iou_individual(pred_Box, gt_Box):
+	x1_t, y1_t, x2_t, y2_t = list(map(int, list(map(float, list(gt_Box)))))
+    
+	x1_p, y1_p, x2_p, y2_p = pred_Box
+
+	if (x1_p > x2_p) or (y1_p > y2_p):
+		raise AssertionError(
+			"Prediction box is malformed? pred box: {}".format(pred_Box))
+	if (x1_t > x2_t) or (y1_t > y2_t):
+		raise AssertionError(
+			"Ground Truth box is malformed? true box: {}".format(gt_Box))
+
+	if (x2_t < x1_p or x2_p < x1_t or y2_t < y1_p or y2_p < y1_t):
+		return 0.0
+    
+	# Calculating Area of Intersection
+	far_x = np.min([x2_t, x2_p])
+	near_x = np.max([x1_t, x1_p])
+	far_y = np.min([y2_t, y2_p])
+	near_y = np.max([y1_t, y1_p])
+
+	inter_area = (far_x - near_x + 1) * (far_y - near_y + 1)
+	tbox_area = (x2_t - x1_t + 1) * (y2_t - y1_t + 1)
+	pbox_area = (x2_p - x1_p + 1) * (y2_p - y1_p + 1)
+	IOU = inter_area / (tbox_area + pbox_area - inter_area)  # Area of intersection / Area of Union s
+	
+	return IOU
+
+def convert_polygon_to_rectangle(coordinates):
+	
+	rect_coordinates = []
+	for single in coordinates:
+		xmax = INF_MIN
+		ymax = INF_MIN
+		xmin = INF_MAX
+		ymin = INF_MAX
+		for coord in single:
+			xmin = min(coord[0],xmin)
+			ymin = min(coord[1],ymin)
+			xmax = max(coord[0],xmax)
+			ymax = max(coord[1],ymax)
+		rect_coordinates.append([xmin,ymin,xmax,ymax])
+		
+	return rect_coordinates
+
+
+def find_average(dict_g, dict_p, img):
+	gt_boxes = dict_g
+	pred_boxes = dict_p
+	g_y = average_iou(gt_boxes[img],pred_boxes[img]['boxes'],IOU_THR)
+	
+	return g_y
+
+def coordinate_as_gt(class_type):
+	gd = []
+	for dat in class_type:
+		box = dat
+		gd.append(box)
+	return gd
+	
+
+def retina_thread(image_path):
+	# fn_retina = "retina_r.csv"
+	retina_time=detection_on_image(image_path)  # detection_on_image will also generate a csv file -> 'retina_r.csv'(each time for a parsed image)
+	return retina_time
+	
+
+def main():
+    # for folder in range(0,1): ---> old with indentation removed
+    import os
+    lit = os.listdir("E://IISc//Object_detection//IDD//IDD_Detection//test//" + "txt//")   # GT
+    
+    path_gt = "E://IISc//Object_detection//IDD//IDD_Detection//test//" + "txt//"   # GT - same as lit
+    path_image = "E://IISc//Object_detection//IDD//IDD_Detection//test//" + "images//"  # IMAGE 
+    cnt=0
+    for f_n in lit:
+        cnt += 1
+        print(cnt)
+        print(f_n)
+        file_gt = open(path_gt + f_n)
+        # json_gt = json.load(file_gt)
+        txt_file = path_gt + f_n
+
+        ind = f_n.split('.txt')[0] 
+        # img = f_n[0:ind] +"_leftImg8bit.png"
+        img = ind + ".jpeg"
+
+        path_img = path_image + img
+        #path_img = "./Data/IMAGE/train/0/010515_leftImg8bit.png"
+        # List for all classes objects seperately for this image
+        
+        bicycle = []
+        bus = []
+        traffic_sign = []
+        motorcycle = []
+        car = []
+        traffic_light = []
+        person = []
+        vehicle_fallback = []
+        truck = []
+        autorickshaw = []
+        animal = []
+        rider = []
+        
+        
+        # objects= json_gt['objects']
+        with open(txt_file) as f:
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                # print("line class", line.split(" ")[0])
+                if(line.split(" ")[0] == "0"):
+                    bicycle.append([line.split(" ")[1],line.split(" ")[2],line.split(" ")[3],line.split(" ")[4].split('\n')[0]])         # [xmin,ymin,xmax,ymax] ->  bounding box values
+                    # print("bicycle:", bicycle)
+                elif(line.split(" ")[0] == '1'):                                                                                         # xmin -> line.split(" ")[1]
+                    bus.append([line.split(" ")[1],line.split(" ")[2],line.split(" ")[3],line.split(" ")[4].split('\n')[0]])             # ymin -> line.split(" ")[2]
+                    # print("bus:", bus)
+                elif(line.split(" ")[0] == '2'):                                                                                         # xmax -> line.split(" ")[3]
+                    traffic_sign.append([line.split(" ")[1],line.split(" ")[2],line.split(" ")[3],line.split(" ")[4].split('\n')[0]])    # xmax -> line.split(" ")[4]
+                    # print("traffic_sign:", traffic_sign)
+                elif(line.split(" ")[0] == '3'):
+                    motorcycle.append([line.split(" ")[1],line.split(" ")[2],line.split(" ")[3],line.split(" ")[4].split('\n')[0]])
+                    # print("motorcycle:", motorcycle)
+                elif(line.split(" ")[0] == '4'):
+                    car.append([line.split(" ")[1],line.split(" ")[2],line.split(" ")[3],line.split(" ")[4].split('\n')[0]])
+                    # print("car:", car)
+                elif(line.split(" ")[0] == '5'):
+                    traffic_light.append([line.split(" ")[1],line.split(" ")[2],line.split(" ")[3],line.split(" ")[4].split('\n')[0]])
+                    # print("traffic_light:", traffic_light)
+                elif(line.split(" ")[0] == '6'):
+                    person.append([line.split(" ")[1],line.split(" ")[2],line.split(" ")[3],line.split(" ")[4].split('\n')[0]])
+                    # print("person:", person)
+                elif(line.split(" ")[0] == '7'):
+                    vehicle_fallback.append([line.split(" ")[1],line.split(" ")[2],line.split(" ")[3],line.split(" ")[4].split('\n')[0]])
+                    # print("vehicle_fallback:", vehicle_fallback)
+                elif(line.split(" ")[0] == '8'):
+                    truck.append([line.split(" ")[1],line.split(" ")[2],line.split(" ")[3],line.split(" ")[4].split('\n')[0]])
+                    # print("truck:", truck)
+                elif(line.split(" ")[0] == '9'):
+                    autorickshaw.append([line.split(" ")[1],line.split(" ")[2],line.split(" ")[3],line.split(" ")[4].split('\n')[0]])
+                    # print("autorickshaw:", autorickshaw)
+                elif(line.split(" ")[0] == '10'):
+                    animal.append([line.split(" ")[1],line.split(" ")[2],line.split(" ")[3],line.split(" ")[4].split('\n')[0]])
+                    # print("animal:", animal)
+                elif(line.split(" ")[0] == '11'):
+                    rider.append([line.split(" ")[1],line.split(" ")[2],line.split(" ")[3],line.split(" ")[4].split('\n')[0]])
+                    # print("rider:", rider)
+        
+        # for obj in objects:  --- old(removed)
+
+        # animals_rect = convert_polygon_to_rectangle(animals)
+        # motorcycle_rect = convert_polygon_to_rectangle(motorcycle)
+        # truck_rect = convert_polygon_to_rectangle(truck)
+        # caravan_rect = convert_polygon_to_rectangle(caravan)
+        # auto_rect = convert_polygon_to_rectangle(auto)
+            
+        # convert_polygon_to_rectangle function output format -> rect_coordinates.append([xmin,ymin,xmax,ymax])    
+        
+        fn_retina =  "output_files\\retina_r.csv"
+        
+        retina_time = retina_thread(path_img)
+        
+        lts = open('output_files\\latency.csv','a')
+        writer_lts = csv.writer(lts)
+        writer_lts.writerow([path_img, retina_time])
+        
+        
+        # Making Ground Boxes as [Xmin, Ymin , Xmax , Ymax] from polygons
+
+        # Renaming the original values and declaring new ones(extra) 
+        # gd_ar - gd_br   ,dict_ar - dict_br        -> bicycle
+        # gd_mr - gd_br1  ,dict_mr - dict_br1       -> bus
+        # gd_tr - gd_tr   ,dict_tr - dict_tr        -> traffic_sign
+        # gd_cr - gd_mr   ,dict_cr - dict_mr        -> motorcycle
+        # gd_tra - gd_ca  ,dict_tra - dict_ca       -> car
+        # gd_tra          ,dict_tra                 -> traffic_light
+        # gd_pr           ,dict_pr                  -> person
+        # gd_vr           ,dict_vr                  -> vehicle_fallback
+        # gd_tra1         ,dict_tra1                -> truck
+        # gd_ar           ,dict_ar                  -> autorickshaw
+        # gd_anr          ,dict_anr                 -> animal
+        # gd_rr           ,dict_rr                  -> rider
+
+        gd_br = coordinate_as_gt(bicycle)
+        dict_br = {img : gd_br}
+        
+        gd_br1 = coordinate_as_gt(bus)
+        dict_br1 = {img : gd_br1}
+        
+        gd_tr = coordinate_as_gt(traffic_sign)
+        dict_tr = {img : gd_tr}
+        
+        gd_mr = coordinate_as_gt(motorcycle)
+        dict_mr = {img : gd_mr}
+        
+        gd_ca = coordinate_as_gt(car)
+        dict_ca = {img : gd_ca}
+        print("dict_ca",dict_ca)
+
+        gd_tra = coordinate_as_gt(traffic_light)
+        dict_tra = {img : gd_tra}
+
+        gd_pr = coordinate_as_gt(person)
+        dict_pr = {img : gd_pr}
+
+        gd_vr = coordinate_as_gt(vehicle_fallback)
+        dict_vr = {img : gd_vr}
+
+        gd_tra1 = coordinate_as_gt(truck)
+        dict_tra1 = {img : gd_tra1}
+
+        gd_ar = coordinate_as_gt(autorickshaw)
+        dict_ar = {img : gd_ar}
+
+        gd_anr = coordinate_as_gt(animal)
+        dict_anr = {img : gd_anr}
+
+        gd_rr = coordinate_as_gt(rider)
+        dict_rr = {img : gd_rr}
+
+        #------------------------------------------------------------------------------
+        # Retina Net Model Calculations
+        
+        retina_box = []
+        retina_score = []
+        df_r = pd.read_csv(fn_retina)
+        for index, row in df_r.iterrows():
+            l = row['box_points']
+            l1 = l[1:-1]
+            l2 = l1.split()
+            l3 = [int(i) for i in l2]
+            retina_box.append(l3)
+            retina_score.append(row['percentage_probability'])
+        
+        dr = {'boxes': retina_box, 'scores': retina_score}
+        dict_r = {img: dr}
+        print("dict_r",dict_r)
+        #--------------------------------------------------------------------------------
+        
+        # MRCNN Model Calculations - not needed(removed)
+        # Yolo Model Calculation - not needed(removed)
+        
+        
+        #---------------------------------------------------- Bicycle ---------------------
+        
+        out_retina = find_average(dict_br, dict_r, img)
+        
+        row = [path_img, out_retina['avg']]
+        csv_bicycle_iou = open('output_files\\bicycle_iou.csv','a', newline='')
+        writer_bicycle_iou = csv.writer(csv_bicycle_iou)
+        writer_bicycle_iou.writerow(row)
+        
+        row = [path_img, out_retina['total_obj'], out_retina['true_pos'], out_retina['false_pos'], out_retina['false_neg'] ]  # 'false_pos' & 'false_neg' also added 
+        csv_bicycle_count = open('output_files\\bicycle_count.csv','a')                                                                     # **only for retinanet - out_mrcnn and out_yolo removed
+        writer_bicycle_count = csv.writer(csv_bicycle_count)
+        # writer_bicycle_count.writerow(["img_path", "total_obj", "true_pos", "false_pos", "false_neg"])
+        writer_bicycle_count.writerow(row)
+        
+        csv_bicycle_iou.flush()
+        csv_bicycle_count.flush()
+        
+        #----------------------------------------------- Bus -----------------------
+        
+        out_retina = find_average(dict_br1, dict_r, img)
+        
+        row = [path_img, out_retina['avg']]
+        csv_bus_iou = open('output_files\\bus_iou.csv','a', newline='')
+        writer_bus_iou = csv.writer(csv_bus_iou)
+        writer_bus_iou.writerow(row)
+        
+        row = [path_img, out_retina['total_obj'], out_retina['true_pos'], out_retina['false_pos'], out_retina['false_neg'] ]
+        csv_bus_count = open('output_files\\bus_count.csv','a')
+        writer_bus_count = csv.writer(csv_bus_count)
+        # writer_bus_count.writerow(["img_path", "total_obj", "true_pos", "false_pos", "false_neg"])
+        writer_bus_count.writerow(row)
+        
+        csv_bus_iou.flush()
+        csv_bus_count.flush()
+        
+        #-----------------------------------------------  Traffic_sign -------------------------------
+        
+        out_retina = find_average(dict_tr, dict_r, img)
+        
+        row = [path_img, out_retina['avg']]
+        csv_traffic_sign_iou = open('output_files\\traffic_sign_iou.csv','a', newline='')
+        writer_traffic_sign_iou = csv.writer(csv_traffic_sign_iou)
+        writer_traffic_sign_iou.writerow(row)
+        
+        row = [path_img, out_retina['total_obj'], out_retina['true_pos'], out_retina['false_pos'], out_retina['false_neg'] ]
+        csv_traffic_sign_count = open('output_files\\traffic_sign_count.csv','a')
+        writer_traffic_sign_count = csv.writer(csv_traffic_sign_count)
+        # writer_traffic_sign_count.writerow(["img_path", "total_obj", "true_pos", "false_pos", "false_neg"])
+        writer_traffic_sign_count.writerow(row)
+        
+        csv_traffic_sign_iou.flush()
+        csv_traffic_sign_count.flush()
+        #--------------------------------------------- Motorcycle -----------------------------------
+        
+        out_retina = find_average(dict_mr, dict_r, img)
+        
+        row = [path_img, out_retina['avg']]
+        csv_motorcycle_iou = open('output_files\\motorcycle_iou.csv','a', newline='')
+        writer_motorcycle_iou = csv.writer(csv_motorcycle_iou)
+        writer_motorcycle_iou.writerow(row)
+        
+        row = [path_img, out_retina['total_obj'], out_retina['true_pos'], out_retina['false_pos'], out_retina['false_neg'] ]
+        csv_motorcycle_count = open('output_files\\motorcycle_count.csv','a')
+        writer_motorcycle_count = csv.writer(csv_motorcycle_count)
+        # writer_motorcycle_count.writerow(["img_path", "total_obj", "true_pos", "false_pos", "false_neg"])
+        writer_motorcycle_count.writerow(row)
+        
+        csv_motorcycle_iou.flush()
+        csv_motorcycle_count.flush()
+        #-------------------------------------------- car -------------------------------------
+        out_retina = find_average(dict_ca, dict_r, img)
+        
+        row = [path_img, out_retina['avg']]
+        csv_car_iou = open('output_files\\car_iou.csv','a', newline='')
+        writer_car_iou = csv.writer(csv_car_iou)
+        writer_car_iou.writerow(row)
+        
+        row = [path_img, out_retina['total_obj'], out_retina['true_pos'], out_retina['false_pos'], out_retina['false_neg'] ]
+        csv_car_count = open('output_files\\car_count.csv','a')
+        writer_car_count = csv.writer(csv_car_count)
+        # writer_car_count.writerow(["img_path", "total_obj", "true_pos", "false_pos", "false_neg"])
+        writer_car_count.writerow(row)
+        
+        csv_car_iou.flush()
+        csv_car_count.flush()
+        #-------------------------------------------- Traffic_light -------------------------------------
+
+        out_retina = find_average(dict_tra, dict_r, img)
+        
+        row = [path_img, out_retina['avg']]
+        csv_traffic_light_iou = open('output_files\\traffic_light_iou.csv','a', newline='')
+        writer_traffic_light_iou = csv.writer(csv_traffic_light_iou)
+        writer_traffic_light_iou.writerow(row)
+        
+        row = [path_img, out_retina['total_obj'], out_retina['true_pos'], out_retina['false_pos'], out_retina['false_neg'] ]
+        csv_traffic_light_count = open('output_files\\traffic_light_count.csv','a')
+        writer_traffic_light_count = csv.writer(csv_traffic_light_count)
+        # writer_traffic_light_count.writerow(["img_path", "total_obj", "true_pos", "false_pos", "false_neg"])
+        writer_traffic_light_count.writerow(row)
+        
+        csv_traffic_light_iou.flush()
+        csv_traffic_light_count.flush()
+        #-------------------------------------------- Person -------------------------------------
+        
+        out_retina = find_average(dict_pr, dict_r, img)
+        
+        row = [path_img, out_retina['avg']]
+        csv_person_iou = open('output_files\\person_iou.csv','a', newline='')
+        writer_person_iou = csv.writer(csv_person_iou)
+        writer_person_iou.writerow(row)
+        
+        row = [path_img, out_retina['total_obj'], out_retina['true_pos'], out_retina['false_pos'], out_retina['false_neg'] ]
+        csv_person_count = open('output_files\\person_count.csv','a')
+        writer_person_count = csv.writer(csv_person_count)
+        # writer_person_count.writerow(["img_path", "total_obj", "true_pos", "false_pos", "false_neg"])
+        writer_person_count.writerow(row)
+        
+        csv_person_iou.flush()
+        csv_person_count.flush()
+        #-------------------------------------------- Vehicle_fallback -------------------------------------
+        
+        out_retina = find_average(dict_vr, dict_r, img)
+        
+        row = [path_img, out_retina['avg']]
+        csv_vehicle_fallback_iou = open('output_files\\vehicle_fallback_iou.csv','a', newline='')
+        writer_vehicle_fallback_iou = csv.writer(csv_vehicle_fallback_iou)
+        writer_vehicle_fallback_iou.writerow(row)
+        
+        row = [path_img, out_retina['total_obj'], out_retina['true_pos'], out_retina['false_pos'], out_retina['false_neg'] ]
+        csv_vehicle_fallback_count = open('output_files\\vehicle_fallback_count.csv','a')
+        writer_vehicle_fallback_count = csv.writer(csv_vehicle_fallback_count)
+        # writer_vehicle_fallback_count.writerow(["img_path", "total_obj", "true_pos", "false_pos", "false_neg"])
+        writer_vehicle_fallback_count.writerow(row)
+        
+        csv_vehicle_fallback_iou.flush()
+        csv_vehicle_fallback_count.flush()
+        #-------------------------------------------- Truck -------------------------------------
+        
+        out_retina = find_average(dict_tra1, dict_r, img)
+        
+        row = [path_img, out_retina['avg']]
+        csv_truck_iou = open('output_files\\truck_iou.csv','a', newline='')
+        writer_truck_iou = csv.writer(csv_truck_iou)
+        writer_truck_iou.writerow(row)
+        
+        row = [path_img, out_retina['total_obj'], out_retina['true_pos'], out_retina['false_pos'], out_retina['false_neg'] ]
+        csv_truck_count = open('output_files\\truck_count.csv','a')
+        writer_truck_count = csv.writer(csv_truck_count)
+        # writer_truck_count.writerow(["img_path", "total_obj", "true_pos", "false_pos", "false_neg"])
+        writer_truck_count.writerow(row)
+        
+        csv_truck_iou.flush()
+        csv_truck_count.flush()
+        #-------------------------------------------- Autorickshaw -------------------------------------
+        
+        out_retina = find_average(dict_ar, dict_r, img)
+        
+        row = [path_img, out_retina['avg']]
+        csv_autorickshaw_iou = open('output_files\\autorickshaw_iou.csv','a', newline='')
+        writer_autorickshaw_iou = csv.writer(csv_autorickshaw_iou)
+        writer_autorickshaw_iou.writerow(row)
+        
+        row = [path_img, out_retina['total_obj'], out_retina['true_pos'], out_retina['false_pos'], out_retina['false_neg'] ]
+        csv_autorickshaw_count = open('output_files\\autorickshaw_count.csv','a')
+        writer_autorickshaw_count = csv.writer(csv_autorickshaw_count)
+        # writer_autorickshaw_count.writerow(["img_path", "total_obj", "true_pos", "false_pos", "false_neg"])
+        writer_autorickshaw_count.writerow(row)
+        
+        csv_autorickshaw_iou.flush()
+        csv_autorickshaw_count.flush()
+        #-------------------------------------------- Animal -------------------------------------
+        
+        out_retina = find_average(dict_anr, dict_r, img)
+        
+        row = [path_img, out_retina['avg']]
+        csv_animal_iou = open('output_files\\animal_iou.csv','a', newline='')
+        writer_animal_iou = csv.writer(csv_animal_iou)
+        writer_animal_iou.writerow(row)
+        
+        row = [path_img, out_retina['total_obj'], out_retina['true_pos'], out_retina['false_pos'], out_retina['false_neg'] ]
+        csv_animal_count = open('output_files\\animal_count.csv','a')
+        writer_animal_count = csv.writer(csv_animal_count)
+        # writer_animal_count.writerow(["img_path", "total_obj", "true_pos", "false_pos", "false_neg"])
+        writer_animal_count.writerow(row)
+        
+        csv_animal_iou.flush()
+        csv_animal_count.flush()
+        #-------------------------------------------- Rider -------------------------------------
+    
+        out_retina = find_average(dict_rr, dict_r, img)
+        print("dict_rr - rider", dict_rr)
+        
+        row = [path_img, out_retina['avg']]
+        csv_rider_iou = open('output_files\\rider_iou.csv','a', newline='')
+        writer_rider_iou = csv.writer(csv_rider_iou)
+        writer_rider_iou.writerow(row)
+        
+        
+        row = [path_img, out_retina['total_obj'], out_retina['true_pos'], out_retina['false_pos'], out_retina['false_neg'] ]
+        csv_rider_count = open('output_files\\rider_count.csv','a')
+        writer_rider_count = csv.writer(csv_rider_count)
+        # writer_rider_count.writerow(["img_path", "total_obj", "true_pos", "false_pos", "false_neg"])
+        writer_rider_count.writerow(row)
+        
+        csv_rider_iou.flush()
+        csv_rider_count.flush()
+                        
+main()
+
+
+
